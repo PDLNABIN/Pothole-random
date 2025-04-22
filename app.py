@@ -25,11 +25,46 @@ st.set_page_config(
     layout="wide"
 )
 
+# Add custom CSS for full-width map
+st.markdown("""
+<style>
+.folium-map {
+    width: 100% !important;
+    height: 800px !important;
+}
+[data-testid="stMetricValue"] {
+    font-size: 50px;
+}
+[data-testid="stMetricLabel"] {
+    font-size: 20px;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# Initialize session state for caching processed data
+if 'data' not in st.session_state:
+    st.session_state.data = None
+if 'las' not in st.session_state:
+    st.session_state.las = None
+if 'crs' not in st.session_state:
+    st.session_state.crs = None
+if 'xyz' not in st.session_state:
+    st.session_state.xyz = None
+if 'features_computed' not in st.session_state:
+    st.session_state.features_computed = False
+if 'inference_done' not in st.session_state:
+    st.session_state.inference_done = False
+if 'last_file_name' not in st.session_state:
+    st.session_state.last_file_name = None
+
 # App title only
 st.title("LiDAR Pothole Detection System")
 
 # Create tabs immediately below the title
 tab1, tab2, tab3, tab4 = st.tabs(["Original Cloud", "Pothole Detection", "Map View", "Export"])
+
+# Sidebar controls
+point_size = st.sidebar.slider("Point Size", 1, 10, 3)
 
 # Load model and scaler
 @st.cache_resource
@@ -62,7 +97,6 @@ def compute_geometric_features(xyz, radius=0.5, max_nn=30):
     pcd.estimate_normals(
         search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=max_nn)
     )
-    
     normals = np.asarray(pcd.normals)
     
     # Update progress
@@ -83,7 +117,6 @@ def compute_geometric_features(xyz, radius=0.5, max_nn=30):
     for i in range(0, total_points, batch_size):
         end_idx = min(i + batch_size, total_points)
         batch_indices = indices[i:end_idx]
-        
         for j, idx in enumerate(batch_indices):
             neighbors = xyz[idx]
             cov = np.cov(neighbors.T)
@@ -106,7 +139,7 @@ def compute_geometric_features(xyz, radius=0.5, max_nn=30):
     return normals, curvatures, roughnesses
 
 # Function to process LAS file and prepare features
-def process_las_file(las_file, sample_size=None):
+def process_las_file(las_file):
     with st.spinner("Processing LAS file..."):
         # Create a temporary file
         with tempfile.NamedTemporaryFile(delete=False, suffix='.las') as tmp_file:
@@ -116,26 +149,20 @@ def process_las_file(las_file, sample_size=None):
         # Read the LAS file
         las = laspy.read(tmp_path)
         
-        # Get point count and sample if necessary
+        # Get point count
         point_count = len(las.points)
         st.sidebar.write(f"Total points in LAS file: {point_count:,}")
         
-        if sample_size and point_count > sample_size:
-            indices = np.random.choice(point_count, sample_size, replace=False)
-            st.sidebar.write(f"Sampling {sample_size:,} points for processing")
-        else:
-            indices = np.arange(point_count)
-        
-        # Extract coordinates
-        x = np.array(las.x[indices], dtype=np.float64)
-        y = np.array(las.y[indices], dtype=np.float64)
-        z = np.array(las.z[indices], dtype=np.float64)
+        # Extract coordinates - use all points, no sampling
+        x = np.array(las.x, dtype=np.float64)
+        y = np.array(las.y, dtype=np.float64)
+        z = np.array(las.z, dtype=np.float64)
         
         # Extract color information if available
         if hasattr(las, 'red') and hasattr(las, 'green') and hasattr(las, 'blue'):
-            r = np.array(las.red[indices], dtype=np.float64) / 65535.0
-            g = np.array(las.green[indices], dtype=np.float64) / 65535.0
-            b = np.array(las.blue[indices], dtype=np.float64) / 65535.0
+            r = np.array(las.red, dtype=np.float64) / 65535.0
+            g = np.array(las.green, dtype=np.float64) / 65535.0
+            b = np.array(las.blue, dtype=np.float64) / 65535.0
         else:
             st.sidebar.warning("No color data found in LAS file. Using default values.")
             r = np.zeros_like(x)
@@ -171,6 +198,10 @@ def process_las_file(las_file, sample_size=None):
 
 # Function to compute geometric features when needed
 def compute_features_for_detection(data, xyz):
+    # Check if features have already been computed
+    if st.session_state.features_computed:
+        return st.session_state.data
+    
     with st.spinner("Computing geometric features for detection..."):
         # Compute geometric features with progress tracking
         st.sidebar.write("Computing geometric features...")
@@ -187,11 +218,19 @@ def compute_features_for_detection(data, xyz):
         if data.isnull().any().any():
             st.sidebar.warning("Filling NaN values with column means...")
             data = data.fillna(data.mean())
-            
+        
+        # Update session state
+        st.session_state.data = data
+        st.session_state.features_computed = True
+        
         return data
 
 # Function to run inference with the Random Forest model
 def run_inference(data, model, scaler):
+    # Check if inference has already been done
+    if st.session_state.inference_done:
+        return st.session_state.data
+    
     with st.spinner("Running pothole detection..."):
         features = ['x', 'y', 'z', 'r', 'g', 'b', 'nx', 'ny', 'nz', 'curvature', 'roughness']
         
@@ -220,24 +259,23 @@ def run_inference(data, model, scaler):
         
         # Make predictions
         preds = model.predict(X_scaled)
-        
         pothole_count = np.sum(preds == 1)
         st.sidebar.success(f"Found {pothole_count:,} potential potholes out of {len(preds):,} points ({pothole_count/len(preds)*100:.2f}%)")
         
         # Add predictions to original data
         data['pred'] = preds
         
+        # Update session state
+        st.session_state.data = data
+        st.session_state.inference_done = True
+        
         return data
 
 # Function to visualize the original point cloud in RGB
-def visualize_original_point_cloud(data, point_size, max_points=100000):
+def visualize_original_point_cloud(data, point_size):
     with st.spinner("Preparing original point cloud visualization..."):
-        # Sample data if too large
-        if len(data) > max_points:
-            st.info(f"Sampling {max_points:,} points for visualization")
-            sample_data = data.sample(max_points)
-        else:
-            sample_data = data
+        # Use all data points, no sampling
+        sample_data = data
         
         # Prepare data for visualization
         xyz = sample_data[['x', 'y', 'z']].values
@@ -277,20 +315,18 @@ def visualize_original_point_cloud(data, point_size, max_points=100000):
                 yaxis=dict(showgrid=False, zeroline=False),  # Remove grid
                 zaxis=dict(showgrid=False, zeroline=False)   # Remove grid
             ),
-            margin=dict(l=0, r=0, b=0, t=0)
+            margin=dict(l=0, r=0, b=0, t=0),
+            height=800,  # Increased height
+            width=1200   # Increased width
         )
         
         st.plotly_chart(fig, use_container_width=True)
 
 # Function to visualize the point cloud with pothole predictions
-def visualize_pothole_detection(data, point_size, max_points=100000):
+def visualize_pothole_detection(data, point_size):
     with st.spinner("Preparing pothole detection visualization..."):
-        # Sample data if too large
-        if len(data) > max_points:
-            st.info(f"Sampling {max_points:,} points for visualization")
-            sample_data = data.sample(max_points)
-        else:
-            sample_data = data
+        # Use all data points, no sampling
+        sample_data = data
         
         # Prepare data for visualization
         xyz = sample_data[['x', 'y', 'z']].values
@@ -336,7 +372,9 @@ def visualize_pothole_detection(data, point_size, max_points=100000):
                 yaxis=dict(showgrid=False, zeroline=False),  # Remove grid
                 zaxis=dict(showgrid=False, zeroline=False)   # Remove grid
             ),
-            margin=dict(l=0, r=0, b=0, t=0)
+            margin=dict(l=0, r=0, b=0, t=0),
+            height=800,  # Increased height
+            width=1200   # Increased width
         )
         
         st.plotly_chart(fig, use_container_width=True)
@@ -377,18 +415,20 @@ def calculate_pothole_volumes(data, min_points=10):
             cluster_points = pothole_data[pothole_data['cluster'] == i]
             if len(cluster_points) < 4:  # Need at least 4 points for ConvexHull
                 continue
-                
+            
             try:
                 # Use ConvexHull to calculate volume
                 hull = ConvexHull(cluster_points[['x', 'y', 'z']].values)
-                volume = hull.volume
+                volume_m3 = hull.volume
+                volume_cm3 = volume_m3 * 1000000  # Convert to cubic centimeters
                 
                 # Calculate centroid
                 centroid = cluster_points[['x', 'y', 'z']].mean().values
                 
                 volumes.append({
                     'cluster_id': i,
-                    'volume': volume,
+                    'volume_m3': volume_m3,
+                    'volume_cm3': volume_cm3,
                     'point_count': len(cluster_points),
                     'centroid_x': centroid[0],
                     'centroid_y': centroid[1],
@@ -411,7 +451,7 @@ def display_pothole_map(data, volumes_df, crs=None):
         if volumes_df is None or len(volumes_df) == 0:
             st.warning("No pothole data available for mapping")
             return
-        
+            
         # Create a map centered at the mean of the data
         center_x = volumes_df['centroid_x'].mean()
         center_y = volumes_df['centroid_y'].mean()
@@ -427,207 +467,239 @@ def display_pothole_map(data, volumes_df, crs=None):
                     volumes_df['centroid_x'].values,
                     volumes_df['centroid_y'].values
                 )
-                
                 volumes_df['lon'] = lons
                 volumes_df['lat'] = lats
                 
                 center_lon, center_lat = transformer.transform(center_x, center_y)
                 
-                m = folium.Map(location=[center_lat, center_lon], zoom_start=18)
+                # Create map with larger dimensions
+                m = folium.Map(location=[center_lat, center_lon], zoom_start=18, width='100%', height='100%')
                 
                 # Add pothole markers with popup showing volume information
                 for _, row in volumes_df.iterrows():
-                    # Scale marker size based on volume
-                    radius = min(20, max(5, np.log(row['volume'] + 1) * 2))
+                    # Determine icon color based on volume size
+                    if row['volume_cm3'] > 10000:
+                        icon_color = 'red'
+                        severity = 'High'
+                    elif row['volume_cm3'] > 5000:
+                        icon_color = 'orange'
+                        severity = 'Medium'
+                    else:
+                        icon_color = 'blue'
+                        severity = 'Low'
                     
                     popup_html = f"""
-                    <div style="font-family: Arial; width: 200px;">
-                        <h4>Pothole Cluster {row['cluster_id']}</h4>
-                        <b>Volume:</b> {row['volume']:.2f} cubic units<br>
-                        <b>Point Count:</b> {row['point_count']}<br>
+                    <div style="width: 250px">
+                        <h4 style="color:{icon_color}; text-align:center">Pothole #{int(row['cluster_id'])}</h4>
+                        <p><b>Volume:</b> {row['volume_cm3']:.2f} cm³</p>
+                        <p><b>Point Count:</b> {row['point_count']}</p>
+                        <p><b>Location:</b> ({row['lat']:.6f}, {row['lon']:.6f})</p>
+                        <p><b>Severity:</b> {severity}</p>
                     </div>
                     """
                     
-                    folium.CircleMarker(
+                    # Use a more visible icon for potholes
+                    folium.Marker(
                         location=[row['lat'], row['lon']],
-                        radius=radius,
-                        color='red',
+                        popup=folium.Popup(popup_html, max_width=300),
+                        icon=folium.Icon(color=icon_color, icon='road', prefix='fa')
+                    ).add_to(m)
+                    
+                    # Also add a circle to represent the size
+                    folium.Circle(
+                        location=[row['lat'], row['lon']],
+                        radius=max(1, min(20, row['volume_cm3'] / 1000)),  # Scale radius based on volume
+                        color=icon_color,
                         fill=True,
-                        fill_color='red',
-                        fill_opacity=0.7,
-                        popup=folium.Popup(popup_html, max_width=300)
+                        fill_color=icon_color,
+                        fill_opacity=0.4
                     ).add_to(m)
                 
-                # Display the map with explicit dimensions
-                folium_static(m, width=800, height=600)
-                
+                # Use folium_static with full width
+                folium_static(m, width=1400, height=800)
             except Exception as e:
-                st.error(f"Error creating map with CRS transformation: {e}")
-                st.info("Displaying pothole locations in original coordinate system instead")
-                display_local_map(volumes_df)
+                st.error(f"Error creating map: {e}")
+                st.info("If your LAS file doesn't have a valid CRS, mapping may not be possible.")
         else:
-            # If no CRS, display in local coordinates
-            display_local_map(volumes_df)
+            st.warning("No coordinate reference system (CRS) found in the LAS file. Cannot create map.")
 
-# Function to display pothole locations in local coordinates
-def display_local_map(volumes_df):
-    # Create a simple scatter plot of pothole locations
-    fig, ax = plt.subplots(figsize=(10, 8))
-    
-    # Scale marker size based on volume
-    sizes = np.log(volumes_df['volume'] + 1) * 10
-    
-    scatter = ax.scatter(
-        volumes_df['centroid_x'],
-        volumes_df['centroid_y'],
-        c='red',
-        s=sizes,
-        alpha=0.7
-    )
-    
-    # Add annotations for larger potholes
-    for _, row in volumes_df.nlargest(5, 'volume').iterrows():
-        ax.annotate(
-            f"Vol: {row['volume']:.1f}",
-            (row['centroid_x'], row['centroid_y']),
-            xytext=(5, 5),
-            textcoords='offset points'
-        )
-    
-    ax.set_title('Pothole Locations (Local Coordinates)')
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.grid(True)
-    
-    # Add colorbar legend
-    plt.colorbar(scatter, label='Volume')
-    
-    st.pyplot(fig)
-
-# Function to prepare export data
-def prepare_export_data(data):
-    # Create a copy of the data with only the required columns
-    export_df = data[['x', 'y', 'z', 'r', 'g', 'b', 'pred']].copy()
-    
-    # Rename the prediction column to be more descriptive
-    export_df = export_df.rename(columns={'pred': 'predicted_label'})
-    
-    return export_df
+# Function to export pothole data
+def export_pothole_data(data, volumes_df):
+    with st.spinner("Preparing data for export..."):
+        if 'pred' not in data.columns:
+            st.warning("No pothole detection results available for export")
+            return
+        
+        # Create columns for export options
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("Export Point Cloud")
+            
+            # Export options for point cloud
+            export_format = st.selectbox(
+                "Select export format",
+                ["CSV", "GeoJSON (if CRS available)"]
+            )
+            
+            export_points = st.radio(
+                "Points to export",
+                ["All points", "Pothole points only"]
+            )
+            
+            if st.button("Export Point Cloud"):
+                # Filter data if needed
+                if export_points == "Pothole points only":
+                    export_data = data[data['pred'] == 1].copy()
+                else:
+                    export_data = data.copy()
+                
+                if len(export_data) == 0:
+                    st.warning("No points to export")
+                    return
+                
+                # Export based on selected format
+                if export_format == "CSV":
+                    csv = export_data.to_csv(index=False)
+                    st.download_button(
+                        label="Download CSV",
+                        data=csv,
+                        file_name="pothole_detection.csv",
+                        mime="text/csv"
+                    )
+                else:  # GeoJSON
+                    if st.session_state.crs:
+                        try:
+                            # Create GeoDataFrame
+                            geometry = [Point(x, y) for x, y in zip(export_data['x'], export_data['y'])]
+                            gdf = gpd.GeoDataFrame(export_data, geometry=geometry, crs=st.session_state.crs)
+                            
+                            # Convert to GeoJSON
+                            geojson = gdf.to_json()
+                            st.download_button(
+                                label="Download GeoJSON",
+                                data=geojson,
+                                file_name="pothole_detection.geojson",
+                                mime="application/json"
+                            )
+                        except Exception as e:
+                            st.error(f"Error creating GeoJSON: {e}")
+                    else:
+                        st.warning("No CRS available. Cannot export as GeoJSON.")
+        
+        with col2:
+            st.subheader("Export Pothole Analysis")
+            
+            if volumes_df is not None and len(volumes_df) > 0:
+                # Export options for pothole analysis
+                if st.button("Export Pothole Analysis"):
+                    csv = volumes_df.to_csv(index=False)
+                    st.download_button(
+                        label="Download Pothole Analysis CSV",
+                        data=csv,
+                        file_name="pothole_analysis.csv",
+                        mime="text/csv"
+                    )
+            else:
+                st.warning("No pothole analysis available for export")
 
 # Main application flow
 def main():
     # Load model and scaler
     model, scaler = load_model_and_scaler()
     
-    # Sidebar for controls
-    st.sidebar.header("Controls")
+    # File uploader in sidebar
+    las_file = st.sidebar.file_uploader("Upload LAS file", type=['las', 'laz'])
     
-    # Processing options
-    sample_size = st.sidebar.number_input(
-        "Sample size for processing (0 for all points)",
-        min_value=0,
-        max_value=1000000,
-        value=100000,
-        step=10000
-    )
-    
-    if sample_size == 0:
-        sample_size = None
-    
-    # Add visualization settings
-    st.sidebar.header("Visualization Settings")
-    point_size = st.sidebar.slider(
-        "Point Size", 
-        min_value=1, 
-        max_value=10, 
-        value=4,
-        step=1,
-        help="Adjust the size of points in 3D visualizations"
-    )
-    
-    # File uploader
-    uploaded_file = st.sidebar.file_uploader("Upload a .las file", type=["las"])
-    
-    # Process file if uploaded
-    if uploaded_file and model is not None and scaler is not None:
-        try:
-            # Process the file
-            data, las, crs, xyz = process_las_file(uploaded_file, sample_size)
+    if las_file is not None:
+        # Check if we need to process the file (new file or first run)
+        file_changed = (st.session_state.last_file_name != las_file.name)
+        
+        if file_changed or st.session_state.data is None:
+            # Reset session state for new file
+            st.session_state.features_computed = False
+            st.session_state.inference_done = False
+            st.session_state.last_file_name = las_file.name
             
-            # Compute geometric features before inference
-            data = compute_features_for_detection(data, xyz)
+            # Process the LAS file
+            df, las, crs, xyz = process_las_file(las_file)
             
-            # Run inference
-            results = run_inference(data, model, scaler)
-            
-            # Calculate pothole volumes
-            volumes_df = calculate_pothole_volumes(results)
-            
-            # Fill the tabs with content
-            with tab1:
-                # Original point cloud visualization
-                st.subheader("Original Point Cloud (RGB)")
-                visualize_original_point_cloud(data, point_size)
-            
-            with tab2:
-                # Pothole detection visualization
-                st.subheader("Pothole Detection Results")
-                st.write("Red: Potholes | Blue: Non-road surfaces")
-                visualize_pothole_detection(results, point_size)
-            
-            with tab3:
-                # Map view
-                st.subheader("Pothole Map")
-                st.write("Click on markers to see pothole volume information")
-                if volumes_df is not None and not volumes_df.empty:
-                    display_pothole_map(results, volumes_df, crs)
-                else:
-                    st.info("No pothole clusters identified for mapping")
-            
-            with tab4:
-                # Export options
-                st.subheader("Export Data")
-                
-                # Prepare export data with xyz, rgb, and predicted labels
-                export_df = prepare_export_data(results)
-                
-                # Display the data preview
-                st.dataframe(export_df.head(100))  # Show first 100 rows
-                
-                # Option to download results
-                csv = export_df.to_csv(index=False)
-                st.download_button(
-                    label="Download point cloud with predictions (CSV)",
-                    data=csv,
-                    file_name="lidar_pothole_detection.csv",
-                    mime="text/csv",
-                )
-                
-                # Show data statistics
-                st.subheader("Data Statistics")
-                total_points = len(export_df)
-                pothole_points = export_df['predicted_label'].sum()
-                
-                st.write(f"Total points: {total_points:,}")
-                st.write(f"Pothole points: {pothole_points:,} ({pothole_points/total_points*100:.2f}%)")
-                st.write(f"Non-pothole points: {total_points-pothole_points:,} ({(total_points-pothole_points)/total_points*100:.2f}%)")
-                
-        except Exception as e:
-            st.error(f"An error occurred during processing: {e}")
-            st.info("Please check your file and try again.")
-    else:
-        # Show placeholder content in tabs when no file is uploaded
+            # Store in session state
+            st.session_state.data = df
+            st.session_state.las = las
+            st.session_state.crs = crs
+            st.session_state.xyz = xyz
+        
+        # Use data from session state
+        data = st.session_state.data
+        xyz = st.session_state.xyz
+        crs = st.session_state.crs
+        
+        # Original Point Cloud tab
         with tab1:
-            st.info("Please upload a LAS file to view the original point cloud.")
+            st.header("Original Point Cloud")
+            visualize_original_point_cloud(data, point_size)
         
+        # Pothole Detection tab
         with tab2:
-            st.info("Please upload a LAS file to detect potholes.")
+            st.header("Pothole Detection")
+            
+            if model is not None and scaler is not None:
+                # Compute features if not already done
+                data = compute_features_for_detection(data, xyz)
+                
+                # Run inference if not already done
+                data = run_inference(data, model, scaler)
+                
+                # Display pothole detection visualization
+                visualize_pothole_detection(data, point_size)
+                
+                # Calculate pothole volumes
+                volumes_df = calculate_pothole_volumes(data)
+                
+                # Display pothole statistics with cubic centimeters
+                if volumes_df is not None and len(volumes_df) > 0:
+                    st.subheader("Pothole Statistics")
+                    
+                    # Create metrics for total volume
+                    total_volume_cm3 = volumes_df['volume_cm3'].sum()
+                    avg_volume_cm3 = volumes_df['volume_cm3'].mean()
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Total Potholes", f"{len(volumes_df)}")
+                    with col2:
+                        st.metric("Total Volume", f"{total_volume_cm3:.2f} cm³")
+                    with col3:
+                        st.metric("Average Volume", f"{avg_volume_cm3:.2f} cm³")
+                    
+                    # Show detailed table
+                    st.dataframe(volumes_df[['cluster_id', 'volume_cm3', 'point_count', 'centroid_x', 'centroid_y', 'centroid_z']])
+            else:
+                st.warning("Model or scaler not loaded. Cannot perform pothole detection.")
         
+        # Map View tab
         with tab3:
-            st.info("Please upload a LAS file to view pothole locations on a map.")
+            st.header("Pothole Map View")
+            
+            if 'pred' in data.columns:
+                volumes_df = calculate_pothole_volumes(data) if 'volumes_df' not in locals() else volumes_df
+                display_pothole_map(data, volumes_df, crs)
+            else:
+                st.warning("Run pothole detection first to view results on map")
         
+        # Export tab
         with tab4:
-            st.info("Please upload a LAS file to export data.")
+            st.header("Export Data")
+            
+            if 'pred' in data.columns:
+                volumes_df = calculate_pothole_volumes(data) if 'volumes_df' not in locals() else volumes_df
+                export_pothole_data(data, volumes_df)
+            else:
+                st.warning("Run pothole detection first to export results")
+    else:
+        # Display instructions when no file is uploaded
+        st.info("Please upload a LAS file to begin pothole detection")
 
 if __name__ == "__main__":
     main()
